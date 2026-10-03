@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 Vec3 = Tuple[float, float, float]
 Face = Tuple[int, ...]
@@ -71,21 +71,27 @@ def face_center(vertices: Sequence[Vec3], face: Face) -> Vec3:
 def is_front_face(
     vertices: Sequence[Vec3],
     face: Face,
-    eye: Vec3,
+    *,
+    eye: Optional[Vec3] = None,
+    view_dir: Optional[Vec3] = None,
 ) -> Tuple[bool, Vec3, float]:
     """
     Грань лицевая, если нормаль и вектор «к наблюдателю» сонаправлены
     (скалярное произведение > 0).
 
-    eye — положение камеры в той же СК, что и вершины (после model-transform).
-    Для перспективной камеры из ЛР1: eye ≈ (0, -focal, 0) в «мировой»
-    системе до проекции, а вершины уже преобразованы моделью —
-    поэтому eye передаём в мировых координатах сцены.
+    Задать РОВНО один способ взгляда:
+      eye      — точка камеры (перспектива): to_eye = normalize(eye − c);
+      view_dir — направление К камере из сцены (параллельная/аксонометрия),
+                 одно и то же для всех граней (камера в бесконечности).
     """
     n = face_normal(vertices, face)
     c = face_center(vertices, face)
-    # вектор от центра грани к глазу
-    to_eye = _normalize(_sub(eye, c))
+    if view_dir is not None:
+        to_eye = _normalize(view_dir)
+    elif eye is not None:
+        to_eye = _normalize(_sub(eye, c))
+    else:
+        raise ValueError("Нужен eye или view_dir")
     nd = _dot(n, to_eye)
     return nd > 1e-9, n, nd
 
@@ -106,10 +112,15 @@ def roberts_classify(
     vertices: Sequence[Vec3],
     faces: Sequence[Face],
     edges: Sequence[Tuple[int, int]],
-    eye: Vec3,
+    *,
+    eye: Optional[Vec3] = None,
+    view_dir: Optional[Vec3] = None,
 ) -> Tuple[List[bool], List[bool], List[dict]]:
     """
     Классификация по Робертсу.
+
+    eye — для перспективы; view_dir — для ортогональной/аксонометрии
+    (направление к наблюдателю, согласованное с формулой проекции).
 
     Возвращает:
       face_front[i]  — True, если грань i лицевая;
@@ -119,7 +130,9 @@ def roberts_classify(
     face_front: List[bool] = []
     face_info: List[dict] = []
     for fi, face in enumerate(faces):
-        front, normal, ndot = is_front_face(vertices, face, eye)
+        front, normal, ndot = is_front_face(
+            vertices, face, eye=eye, view_dir=view_dir
+        )
         face_front.append(front)
         face_info.append(
             {

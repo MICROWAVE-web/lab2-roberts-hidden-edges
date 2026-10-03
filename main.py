@@ -127,6 +127,9 @@ class RobertsApp:
     HIDDEN = "#94a3b8"
     NORMAL = "#2563eb"
     TEXT = "#111827"
+    # Аксонометрия: Xэкр = x − ISO_KY·y, Yэкр = z + ISO_KZ·y
+    ISO_KY = 0.45
+    ISO_KZ = 0.35
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -272,11 +275,18 @@ class RobertsApp:
         return rotate_z(self.anim_t * 0.7)
 
     def eye_world(self) -> Vec3:
-        """
-        Положение камеры в мировой СК.
-        В ЛР1 камера смотрит вдоль +Y, «глаз» примерно в (0, -focal, 0).
-        """
+        """Точка камеры для перспективы (смотрит вдоль +Y)."""
         return (0.0, -self.focal, 0.0)
+
+    def ortho_view_dir(self) -> Vec3:
+        """
+        Направление К наблюдателю для ортогональной проекции.
+
+        Проекция: (x, y, z) → (x − k_y·y, z + k_z·y).
+        Лучи параллельны D = (k_y, 1, −k_z): сдвиг вдоль D не меняет экран.
+        Наблюдатель смотрит вдоль D, значит вектор «к камере» = −D.
+        """
+        return (-self.ISO_KY, -1.0, self.ISO_KZ)
 
     def project(self, p: Vec3) -> Tuple[float, float]:
         x, y, z = p
@@ -287,8 +297,8 @@ class RobertsApp:
                 screen_w=self.width,
                 screen_h=self.height,
             )
-        iso_x = x - 0.45 * y
-        iso_y = z + 0.35 * y
+        iso_x = x - self.ISO_KY * y
+        iso_y = z + self.ISO_KZ * y
         return self.width * 0.5 + iso_x, self.height * 0.5 - iso_y
 
     def _draw(self) -> None:
@@ -299,10 +309,15 @@ class RobertsApp:
         world = mat_mul(self.animation_matrix(), self.model_matrix())
         pts = transform_points(world, self.vertices)
 
-        # --- Алгоритм Робертса ---
-        face_front, edge_visible, face_info = roberts_classify(
-            pts, self.faces, self.edges, self.eye_world()
-        )
+        # --- Алгоритм Робертса (взгляд должен совпадать с типом проекции!) ---
+        if self.perspective:
+            face_front, edge_visible, face_info = roberts_classify(
+                pts, self.faces, self.edges, eye=self.eye_world()
+            )
+        else:
+            face_front, edge_visible, face_info = roberts_classify(
+                pts, self.faces, self.edges, view_dir=self.ortho_view_dir()
+            )
 
         # нормали (демонстрация)
         if self.show_normals:
