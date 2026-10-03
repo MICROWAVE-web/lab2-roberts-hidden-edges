@@ -42,18 +42,24 @@ RGB = Tuple[int, int, int]
 
 
 def hex_rgb(color: str) -> RGB:
+    """'#rrggbb' → (r, g, b) 0..255 — для записи в буфер кадра."""
     c = color.lstrip("#")
     return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
 
 
 class SoftCanvas:
-    """RGB-буфер → PPM → PhotoImage (обход бага Canvas на macOS)."""
+    """
+    Свой «холст» без Canvas.create_line.
+
+    На macOS tk.Canvas иногда не рисует линии (пустой фон).
+    Здесь: RGB-байты → файл PPM в памяти → tk.PhotoImage → Label.
+    """
 
     def __init__(self, width: int, height: int, bg: str) -> None:
         self.bg = hex_rgb(bg)
         self.width = 0
         self.height = 0
-        self.buf = bytearray()
+        self.buf = bytearray()  # длина = width * height * 3
         self.image: Optional[tk.PhotoImage] = None
         self.resize(width, height)
 
@@ -68,10 +74,12 @@ class SoftCanvas:
         self.clear()
 
     def clear(self) -> None:
+        """Залить весь кадр цветом фона."""
         r, g, b = self.bg
         self.buf[:] = bytes((r, g, b)) * (self.width * self.height)
 
     def point(self, x: int, y: int, rgb: RGB) -> None:
+        """Один пиксель (с проверкой границ)."""
         if 0 <= x < self.width and 0 <= y < self.height:
             i = (y * self.width + x) * 3
             self.buf[i : i + 3] = bytes(rgb)
@@ -87,6 +95,12 @@ class SoftCanvas:
         dashed: bool = False,
         thick: bool = True,
     ) -> None:
+        """
+        Отрезок алгоритмом Брезенхэма.
+
+        dashed=True  — пунктир для СКРЫТЫХ рёбер (режим H);
+        thick=True   — чуть толще линия (соседние пиксели).
+        """
         rgb = hex_rgb(color)
         x0i, y0i = int(round(x0)), int(round(y0))
         x1i, y1i = int(round(x1)), int(round(y1))
@@ -98,6 +112,7 @@ class SoftCanvas:
         x, y = x0i, y0i
         step = 0
         while True:
+            # пунктир: рисуем 4 пикселя, пропускаем 4
             draw = (not dashed) or ((step // 4) % 2 == 0)
             if draw:
                 self.point(x, y, rgb)
@@ -116,20 +131,31 @@ class SoftCanvas:
             step += 1
 
     def flush(self) -> tk.PhotoImage:
+        """Собрать PPM и отдать PhotoImage для Label."""
         header = f"P6 {self.width} {self.height} 255\n".encode("ascii")
         self.image = tk.PhotoImage(data=header + self.buf)
         return self.image
 
 
 class RobertsApp:
+    """
+    Главное окно ЛР2.
+
+    Конвейер кадра (_draw):
+      1) model × animation → мировые вершины
+      2) roberts_classify  → какие рёбра VIS/hid
+      3) project           → пиксели
+      4) SoftCanvas.line   → картинка + панель справа
+    """
+
     BG = "#f4efe6"
-    VISIBLE = "#b91c1c"
-    HIDDEN = "#94a3b8"
+    VISIBLE = "#b91c1c"   # видимые рёбра
+    HIDDEN = "#94a3b8"    # скрытые (пунктир)
     NORMAL = "#2563eb"
     TEXT = "#111827"
-    # Аксонометрия: Xэкр = x − ISO_KY·y, Yэкр = z + ISO_KZ·y
-    ISO_KY = 0.45
-    ISO_KZ = 0.35
+    # Аксонометрия в project() и взгляд в ortho_view_dir() — ОДНИ коэффициенты!
+    ISO_KY = 0.45  # Xэкр = x − ISO_KY·y
+    ISO_KZ = 0.35  # Yэкр = z + ISO_KZ·y
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -173,7 +199,7 @@ class RobertsApp:
         body = tk.Frame(root, bg=self.BG)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # панель демонстрации алгоритма (важно для защиты)
+        # панель демонстрации алгоритма
         self.info = tk.Text(
             body,
             width=36,
@@ -200,18 +226,19 @@ class RobertsApp:
         self.model_kind = "box"  # box | pyramid
         self._load_model()
 
+        # --- состояние преобразований (как в ЛР1) ---
         self.tx = self.ty = self.tz = 0.0
         self.rx = math.radians(-22.0)
         self.ry = math.radians(35.0)
         self.rz = 0.0
         self.sx = self.sy = self.sz = 1.0
 
-        self.perspective = True
-        self.focal = 420.0
-        self.animating = True
+        self.perspective = True   # True → клавиша 2, False → клавиша 1
+        self.focal = 420.0        # «фокус» перспективы и положение eye
+        self.animating = True     # Пробел: вращение вокруг Z
         self.anim_t = 0.0
-        self.show_hidden = True
-        self.show_normals = True
+        self.show_hidden = True   # H: рисовать скрытые пунктиром
+        self.show_normals = True  # N: короткие нормали от центров граней
         self.frame_id = 0
 
         self._drag: Optional[Tuple[int, int]] = None
@@ -220,7 +247,7 @@ class RobertsApp:
         self.root.update_idletasks()
         self._sync_size()
         self._draw()
-        self.root.after(33, self._tick)
+        self.root.after(33, self._tick)  # ~30 FPS
         self.root.lift()
         try:
             self.root.attributes("-topmost", True)
@@ -230,6 +257,7 @@ class RobertsApp:
         self.root.focus_force()
 
     def _load_model(self) -> None:
+        """Подгрузить вершины/грани/рёбра выбранной модели."""
         if self.model_kind == "box":
             self.vertices, self.faces, self.edges = build_convex_box()
             self.face_names = face_names_box()
@@ -261,6 +289,10 @@ class RobertsApp:
             self.view.image = self.soft.image
 
     def model_matrix(self) -> Mat4:
+        """
+        Пользовательские преобразования: S → Rx → Ry → Rz → T.
+        Порядок: сначала масштаб, потом повороты, потом перенос.
+        """
         m = identity()
         m = mat_mul(scale(self.sx, self.sy, self.sz), m)
         m = mat_mul(rotate_x(self.rx), m)
@@ -270,6 +302,7 @@ class RobertsApp:
         return m
 
     def animation_matrix(self) -> Mat4:
+        """Динамика по заданию: непрерывный поворот вокруг Z."""
         if not self.animating:
             return identity()
         return rotate_z(self.anim_t * 0.7)
@@ -280,15 +313,18 @@ class RobertsApp:
 
     def ortho_view_dir(self) -> Vec3:
         """
-        Направление К наблюдателю для ортогональной проекции.
+        Направление К наблюдателю для ортогональной проекции (клавиша 1).
 
         Проекция: (x, y, z) → (x − k_y·y, z + k_z·y).
         Лучи параллельны D = (k_y, 1, −k_z): сдвиг вдоль D не меняет экран.
-        Наблюдатель смотрит вдоль D, значит вектор «к камере» = −D.
+        Наблюдатель смотрит вдоль D ⇒ вектор «к камере» = −D.
+
+        Если сюда подставить взгляд перспективы, рёбра будут «запаздывать».
         """
         return (-self.ISO_KY, -1.0, self.ISO_KZ)
 
     def project(self, p: Vec3) -> Tuple[float, float]:
+        """Мир (x,y,z) → пиксели экрана."""
         x, y, z = p
         if self.perspective:
             return perspective_project(
@@ -297,19 +333,23 @@ class RobertsApp:
                 screen_w=self.width,
                 screen_h=self.height,
             )
+        # аксонометрия (коэффициенты = ISO_KY / ISO_KZ)
         iso_x = x - self.ISO_KY * y
         iso_y = z + self.ISO_KZ * y
         return self.width * 0.5 + iso_x, self.height * 0.5 - iso_y
 
     def _draw(self) -> None:
+        """Один кадр: преобразование → Робертс → проекция → растр."""
         if self.soft.width != self.width or self.soft.height != self.height:
             self.soft.resize(self.width, self.height)
 
         self.soft.clear()
+
+        # 1) аффинные преобразования (ЛР1)
         world = mat_mul(self.animation_matrix(), self.model_matrix())
         pts = transform_points(world, self.vertices)
 
-        # --- Алгоритм Робертса (взгляд должен совпадать с типом проекции!) ---
+        # 2) Робертс: взгляд ОБЯЗАН совпадать с типом проекции
         if self.perspective:
             face_front, edge_visible, face_info = roberts_classify(
                 pts, self.faces, self.edges, eye=self.eye_world()
@@ -319,7 +359,7 @@ class RobertsApp:
                 pts, self.faces, self.edges, view_dir=self.ortho_view_dir()
             )
 
-        # нормали (демонстрация)
+        # 3a) нормали — только для демонстрации (зелёные = front)
         if self.show_normals:
             for fi, face in enumerate(self.faces):
                 c = face_center(pts, face)
@@ -328,7 +368,7 @@ class RobertsApp:
                 color = "#16a34a" if face_front[fi] else "#64748b"
                 self.soft.line(*self.project(c), *self.project(tip), color, thick=False)
 
-        # сначала скрытые (пунктир), потом видимые
+        # 3b) рёбра: сначала пунктир (hid), потом сплошные (VIS)
         projected = [self.project(p) for p in pts]
         for ei, ((a, b), vis) in enumerate(zip(self.edges, edge_visible)):
             x1, y1 = projected[a]
@@ -338,6 +378,7 @@ class RobertsApp:
             elif self.show_hidden:
                 self.soft.line(x1, y1, x2, y2, self.HIDDEN, dashed=True, thick=False)
 
+        # 4) показать кадр
         img = self.soft.flush()
         self.view.configure(image=img)
         self.view.image = img
@@ -358,6 +399,7 @@ class RobertsApp:
         self._update_info_panel(face_info, edge_visible)
 
     def _update_info_panel(self, face_info: List[dict], edge_visible: List[bool]) -> None:
+        """Правая панель: текущие FRONT/back и VIS/hid (для защиты)."""
         lines = [
             "АЛГОРИТМ РОБЕРТСА",
             "=================",
@@ -397,6 +439,7 @@ class RobertsApp:
         self.info.configure(state=tk.DISABLED)
 
     def _tick(self) -> None:
+        """Таймер анимации: чуть крутим угол и перерисовываем."""
         try:
             if not self.view.winfo_exists():
                 return
@@ -418,6 +461,7 @@ class RobertsApp:
         self.sy = self.sz = self.sx
 
     def _on_key(self, event: tk.Event) -> None:
+        """Клавиатура: режимы Робертса + те же преобразования, что в ЛР1."""
         key = event.keysym.lower()
         step = 8.0
         rot = math.radians(5.0)
@@ -443,10 +487,10 @@ class RobertsApp:
             self._load_model()
             return
         if key == "1":
-            self.perspective = False
+            self.perspective = False  # ортогональ + ortho_view_dir
             return
         if key == "2":
-            self.perspective = True
+            self.perspective = True   # перспектива + eye_world
             return
         if key == "0":
             self.tx = self.ty = self.tz = 0.0
